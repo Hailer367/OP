@@ -17,7 +17,12 @@
 
 set -uo pipefail
 
-OP_VERSION=0.4.1
+OP_VERSION=0.4.2
+
+# Config keys that were already in the environment. A config file must not
+# override an explicit one-off override (EGRESS=warp ./start), so load_config
+# skips these. Collected before the defaults below fill every name in.
+ENV_KEYS=" $(compgen -e 2>/dev/null | tr '\n' ' ') "
 SELF=$(readlink -f -- "${BASH_SOURCE[0]}")
 SELF_DIR=$(dirname -- "$SELF")
 
@@ -97,6 +102,7 @@ load_config() {
     k=$(printf '%s' "$k" | tr -d '[:space:]')
     [[ $k =~ ^[A-Z_][A-Z0-9_]*$ ]] || continue
     case $RESERVED in *" $k "*) continue ;; esac
+    case $ENV_KEYS in *" $k "*) continue ;; esac
     printf -v "$k" '%s' "$v"
   done <"$CONFIG"
 }
@@ -772,11 +778,12 @@ options
   --dry-run                  print what would run, then exit
   -h, --help
 
-config: $CONFIG
-  EGRESS=auto            OC=opencode           FOLDER=...
-  PROXY_LIST=url|file    ROTATE_TRIES=8        PROBE=1
-  WARP_PORT=40000        TOR_SOCKS=9050        RESUME_MSG=continue
-  LIMIT_PAT='...'        ROTATE_GATE_MAX=5     ASK=0
+config: $CONFIG   (an environment variable wins over the file)
+  EGRESS=auto        AUTO_INSTALL=1     OC=opencode      FOLDER=...
+  PROXY_LIST=...     ROTATE_TRIES=8     PROBE=1          ASK=0
+  WARP_PORT=40000    TOR_SOCKS=9050     RESUME_MODE=continue   RESUME_MSG=Continue
+  PAT_ROTATE=...     PAT_ASK=...        PAT_NOOP=...     ASK_COOLDOWN=600
+  ROTATE_GATE_MAX=5  ROTATE_GATE_WINDOW=1800            LOG_MAX_KB=1024
 
 egress
   warp    cloudflare WARP through warp-cli (rotates by re-registering)

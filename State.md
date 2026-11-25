@@ -8,9 +8,9 @@ commit.
 
 | | |
 |---|---|
-| version | `0.4.2` (`OP_VERSION` at the top of `start`) |
+| version | `0.4.3` (`OP_VERSION` at the top of `start`) |
 | repo | https://github.com/Hailer367/OP, branch `main`, public |
-| size | one bash file, ~910 lines / ~35 KB, plus docs |
+| size | one bash file, ~914 lines / ~40 KB, plus docs |
 | runtime | bash 4.3+, `curl`, `opencode`. No daemon, no build, no package of its own |
 | platform | Linux only |
 | state | `~/.local/state/op` (`op.log`, `oc.pid`, `limit.flag`, `rotations`, `ask.last`, `auth.json`) |
@@ -51,9 +51,11 @@ stated in the README. Do not promise otherwise.
    - `ask` + `ASK=1` asks the user; `ask` otherwise throttled by `ASK_COOLDOWN`
    - `rot_gate` (max `ROTATE_GATE_MAX` rotations per `ROTATE_GATE_WINDOW`)
    - `hunt` (up to `ROTATE_TRIES` attempts, each verified)
-   - `resume` (`opencode run --auto -c <msg>`), then reopen with `--continue`
-6. **Crash branch** (TUI exited non-zero, no limit): retry on the same route,
-   three strikes in ten minutes, then stop.
+   - `resume_args`: reopen the TUI with
+     `--standalone --continue [--auto] --prompt <msg>`. The prompt is the resume;
+     there is no separate `opencode run` blocking while the TUI is closed.
+6. **Crash branch** (TUI exited non-zero, no limit): retry on the same route with
+   the same prompt, three strikes in ten minutes, then stop.
 7. **Exit**: `0` after a normal quit (`rc` 0/130/143), `1` on loop guard, crash
    streak or no usable route, `2` on usage errors.
 
@@ -67,6 +69,17 @@ A candidate route must pass, in order:
 3. unless `PROBE=0`: a throwaway session actually answers
    (`opencode run --format json --standalone --archived "reply with the word ok"`),
    deleted afterwards. This is a real model call and costs one free-tier request.
+
+## OpenCode server
+
+Every OpenCode process OP starts passes `--standalone`: the TUI, the probe, and
+the `session list/export/delete` calls. A private server inherits the proxy
+environment at launch, so it uses the route OP just verified.
+
+The shared background service must not be used. It is started once, keeps the
+environment (and therefore the old route) it was born with, and a killed session
+can leave it wedged: a `run` against it then sits at `cli starting` forever. That
+was the rotation that resumed into nothing.
 
 ## Egress backends
 
@@ -105,10 +118,18 @@ empty value disables that class.
 
 ## Resume
 
+The resume is not a separate `opencode run` any more. OP reopens the TUI with
+`--standalone --continue [--auto] --prompt <msg>`; the prompt is sent by the
+visible chat. The old run kept the TUI closed for the whole turn and, worse, went
+through the shared background server: that server still used the old route and
+could be left wedged, so the run sometimes never returned and OP sat with nothing
+on screen.
+
 `RESUME_MODE=continue` sends `RESUME_MSG` (`Continue`). `last` reads the newest
-session export and re-sends the last real user message; it costs two extra CLI
-calls and a full session serialization inside the rotation window, and duplicates
-the message. `custom` sends `RESUME_TEXT`.
+session export and re-sends the last real user message; it costs two extra
+`--standalone` CLI calls before the TUI reopens, and duplicates the message.
+`custom` sends `RESUME_TEXT`. `AUTO_CONTINUE=1` adds `--auto` to the reopened TUI
+(not just the resumed turn: the flag lasts for that session instance).
 
 ## Login
 
@@ -139,8 +160,8 @@ wins** (`RESUME_MODE=last ./start` works even with a config file). Keys in
 | `ROTATE_TRIES`, `ROTATE_COOLDOWN`, `ROUTE_WAIT` | 8, 2, 15 | rotation attempts and pacing |
 | `ROTATE_GATE_MAX`, `ROTATE_GATE_WINDOW` | 5, 1800 | loop guard |
 | `PROBE`, `PROBE_TIMEOUT` | 1, 120 | throwaway-session check |
-| `RESUME_MODE`, `RESUME_MSG`, `RESUME_TEXT`, `RESUME_TIMEOUT` | continue, `Continue`, empty, 180 | resume |
-| `AUTO_CONTINUE` | 1 | passes `--auto` to the resume run |
+| `RESUME_MODE`, `RESUME_MSG`, `RESUME_TEXT` | continue, `Continue`, empty | resume |
+| `AUTO_CONTINUE` | 1 | adds `--auto` to the reopened TUI |
 | `ASK` | 0 | 1 = ask before rotating on a rate limit |
 | `WATCH_INTERVAL` | 1 | log poll interval |
 | `LOG_MAX_KB` | 1024 | activity log cap |
@@ -148,7 +169,7 @@ wins** (`RESUME_MODE=last ./start` works even with a config file). Keys in
 
 ## Tests
 
-There are three layers. All are cheap; run all three when touching the loop.
+There are four layers. All are cheap; run all of them when touching the loop.
 
 **1. Built-in self-test** — `./start test` (offline, ~40s). It swaps only the
 outside world: a fake `opencode` (writes a real limit line, answers `run`), a fake
@@ -184,6 +205,19 @@ grep -c abc /tmp/rt/screen.txt   # typed text must be rendered
 
 Expect `tty0=yes tty1=yes` and the typed text in the captured screen.
 
+**4. Reopen after a rotation** — the bug this check exists for: a fake TUI that
+appends one limit line to the watched log, `EGRESS=exec`, a fake trace, under
+`script` (pty). After the rotation, the launches must read:
+
+```
+launch tty0=y args=--standalone
+launch tty0=y args=run --format json --standalone --archived reply with the word ok
+launch tty0=y args=--standalone --continue --auto --prompt Continue
+```
+
+If the third line is missing, or `--prompt` is missing, OP is again waiting on a
+process instead of putting the chat back on screen.
+
 **Live check of the real route:** `./start status`, then `./start rotate` and
 confirm a genuinely different exit IP.
 
@@ -201,10 +235,15 @@ confirm a genuinely different exit IP.
 | config file silently beat env overrides | `load_config` always assigned | skip keys present in the environment |
 | empty `-c ""` resume | an edit deleted `token_guard`/`resume_message`; `bash -n` and the self-test still passed | isolated behaviour checks; helpers are now covered |
 | a fix killed the tool's own shell | `pkill -f <pattern>` matches the command line running it | bracket trick (`pgrep -f 'prox[y].js'`) |
+| rotation ended with no TUI, `Continue` apparently sent | resume used `opencode run` against the shared background server; it kept the old route and could be wedged, so OP blocked with the TUI closed | resume is the reopened TUI's `--prompt`; all launches use `--standalone` |
 
 ## Known limitations
 
-- Rotation is not seamless: the TUI closes and reopens (3-4s on WARP here).
+- Rotation is not seamless: the TUI closes for the rotation itself (3-4s on WARP
+  here), then reopens with the resume prompt. The resumed turn runs in the
+  visible chat, so it no longer adds to the closed window.
+- `AUTO_CONTINUE=1` (default) adds `--auto` to the reopened TUI, so permissions in
+  that session instance are auto-approved, not just the resumed turn.
 - `RESUME_MODE=last` adds a full session export inside that window, and re-sends
   your message (duplicate turn, duplicate tokens). Default stays `continue`.
 - Each WARP rotation is a new registration; Cloudflare rate-limits that. The gate

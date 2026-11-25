@@ -26,9 +26,11 @@ ROTATE_GATE_WINDOW=1800
 PROBE=1
 PROBE_TIMEOUT=120
 
-# what the resumed turn is nudged with
+# what the resumed turn is nudged with (as the TUI's first prompt)
 RESUME_MSG=Continue
-RESUME_TIMEOUT=180
+
+# add --auto when the TUI reopens with the resume prompt
+AUTO_CONTINUE=1
 
 # ask before rotating (0 = rotate by itself)
 ASK=0

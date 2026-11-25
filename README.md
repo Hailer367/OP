@@ -86,15 +86,22 @@ It prints the HTTP proxy URL it created, or nothing when the host route changed.
 ## What a rotation checks
 
 1. The route answers the trace endpoint, and the exit IP differs from the old one
-   (IPv6 compared by /64).
+   (the full address, not just the IPv6 `/64`).
 2. A TLS handshake with `opencode.ai` succeeds through that same route. An exit
    that answers the trace but fails here is the one that kills the chat a minute
    later with `SSL handshake failed ... net_error -202`.
 3. A throwaway session (`run --standalone --archived`) gets an answer and is then
    deleted. A limit answer means the IP is burned; the next one is tried.
 
-Only then does OP resume: `opencode run --auto -c continue`, then the TUI reopens
-with `--continue`.
+Only then does OP reopen the TUI: `--standalone --continue --prompt Continue`.
+The chat is on screen before the resumed turn starts, so a slow turn (or a stale
+OpenCode background server) can no longer leave OP with no TUI to show. A limit in
+that turn is seen by the watcher like any other and rotates again.
+
+Every OpenCode process OP starts uses `--standalone`. The shared background
+service was started on an older route, ignores the current proxy environment, and
+can be left wedged by a killed session; a private server always inherits the route
+OP just verified.
 
 ## What counts as a limit
 
@@ -121,12 +128,17 @@ An empty value disables that class entirely.
 
 ## Resume
 
-`RESUME_MODE` decides what is sent to nudge the chat forward:
+`RESUME_MODE` decides what is sent to nudge the chat forward, as the TUI's
+`--prompt` on reopen:
 
 - `continue` (default) — the literal `RESUME_MSG`, which is `Continue`.
 - `last` — your last real message, read from the session export. The resume
   messages themselves are skipped, so it cannot loop on its own text.
 - `custom` — `RESUME_TEXT`.
+
+`AUTO_CONTINUE=1` (default) also passes `--auto` when the TUI reopens after a
+rotation, so the resumed turn does not stop on a permission prompt. Set it to `0`
+to have those prompts shown.
 
 ## Login
 

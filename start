@@ -17,7 +17,7 @@
 
 set -uo pipefail
 
-OP_VERSION=0.4.2
+OP_VERSION=0.4.3
 
 # Config keys that were already in the environment. A config file must not
 # override an explicit one-off override (EGRESS=warp ./start), so load_config
@@ -61,9 +61,8 @@ ROTATE_GATE_WINDOW=${ROTATE_GATE_WINDOW:-1800}  # seconds
 PROBE=${PROBE:-1}                        # 1 = prove the new IP with a throwaway chat
 PROBE_TIMEOUT=${PROBE_TIMEOUT:-120}
 RESUME_MSG=${RESUME_MSG:-Continue}       # message that nudges the chat forward
-RESUME_TIMEOUT=${RESUME_TIMEOUT:-180}
 WATCH_INTERVAL=${WATCH_INTERVAL:-1}      # seconds between log polls
-AUTO_CONTINUE=${AUTO_CONTINUE:-1}        # resume with --auto (no permission prompts in the resumed turn)
+AUTO_CONTINUE=${AUTO_CONTINUE:-1}        # add --auto when the TUI reopens with the resume prompt
 ASK=${ASK:-0}                            # 1 = ask before rotating (0 = rotate by itself)
 CONFIG=${OP_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/op/config}
 
@@ -511,7 +510,7 @@ probe_ip() {
   out=$(cd "$HOME" && timeout -k 5 "$PROBE_TIMEOUT" "${OC_CMD[@]}" run --format json --standalone --archived \
         "reply with the word ok" 2>&1); rc=$?
   sid=$(printf '%s' "$out" | grep -o 'ses_[A-Za-z0-9]*' | head -n1)
-  [ -n "$sid" ] && timeout 20 "${OC_CMD[@]}" session delete "$sid" >/dev/null 2>&1
+  [ -n "$sid" ] && timeout 20 "${OC_CMD[@]}" session delete --standalone "$sid" >/dev/null 2>&1
   if is_limit_text "$out"; then return 1; fi
   [ "$rc" = 0 ] && return 0
   log "probe rc=$rc: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)"
@@ -592,10 +591,10 @@ token_guard() {
 # the last real message in the chat, minus the resume messages themselves
 last_user_message() {
   local sid j
-  sid=$(timeout 20 "${OC_CMD[@]}" session list --format json -n 1 2>/dev/null \
+  sid=$(timeout 20 "${OC_CMD[@]}" session list --standalone --format json -n 1 2>/dev/null \
         | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\(ses_[A-Za-z0-9]*\)".*/\1/p' | head -n1)
   [ -n "$sid" ] || return 1
-  j=$(timeout 30 "${OC_CMD[@]}" session export "$sid" 2>/dev/null)
+  j=$(timeout 30 "${OC_CMD[@]}" session export --standalone "$sid" 2>/dev/null)
   [ -n "$j" ] || return 1
   if have jq; then
     printf '%s' "$j" | jq -r --arg m "$RESUME_MSG" --arg t "$RESUME_TEXT" \
@@ -622,16 +621,20 @@ resume_message() {
   printf '%s' "$(printf '%s' "$m" | tr '\n' ' ' | cut -c1-2000)"
 }
 
-resume() {
-  local out rc msg auto=()
-  [ "$AUTO_CONTINUE" = 1 ] && auto=(--auto)
+# The resume message is handed to the TUI as --prompt, so the chat is back on
+# screen before the model starts. A separate `opencode run` keeps the TUI closed
+# for the whole resumed turn, and when the shared background server is stale or
+# wedged that run can block until the timeout (or forever) with nothing on screen.
+# If the new IP is limited too, the watcher sees the limit in the resumed turn and
+# rotates again, exactly like any other limit.
+resume_args() {
+  local msg
   export_proxy
   msg=$(resume_message)
   log "resume: ip=$(current_ip) mode=$RESUME_MODE msg=$msg"
-  out=$(cd "$FOLDER" && timeout -k 5 "$RESUME_TIMEOUT" "${OC_CMD[@]}" run "${auto[@]}" -c "$msg" 2>&1); rc=$?
-  printf '%s\n' "$out" | tail -n 6
-  if is_limit_text "$out"; then return 2; fi
-  return $rc
+  cont=(--continue)
+  [ "$AUTO_CONTINUE" = 1 ] && cont+=(--auto)
+  cont+=(--prompt "$msg")
 }
 
 # ---------------------------------------------------------------- the loop
@@ -679,13 +682,16 @@ cmd_run() {
     # and typing would go nowhere. stdin is bound to the terminal above. Running
     # it in the background also keeps bash from printing "Terminated" over the
     # screen when the watcher kills it for a rotation.
+    # --standalone gives the TUI its own server. The shared background server was
+    # started on the old route, ignores the new proxy env, and can be left wedged
+    # by a killed session; using it is how a rotation reopened nothing at all.
     # Ctrl+C belongs to the chat, not to the supervisor: ignore it here so a
     # response interrupt cannot take OP (or the watcher) down and leave the chat
     # unsupervised. GNU env hands the chat the default disposition back, so it
     # still gets Ctrl+C. The watcher is started after this on purpose.
     if [ "${#SIGRESET[@]}" -gt 0 ]; then trap '' INT; fi
     watch_log "$OC_LOG_DIR" & wpid=$!
-    ( cd "$FOLDER" && echo "$BASHPID" >"$OC_PID" && exec ${SIGRESET[@]+"${SIGRESET[@]}"} "${OC_CMD[@]}" "${cont[@]}" ) <"$TTY_IN" &
+    ( cd "$FOLDER" && echo "$BASHPID" >"$OC_PID" && exec ${SIGRESET[@]+"${SIGRESET[@]}"} "${OC_CMD[@]}" --standalone "${cont[@]}" ) <"$TTY_IN" &
     tpid=$!
     wait "$tpid"; rc=$?
     if [ "${#SIGRESET[@]}" -gt 0 ]; then trap - INT; fi
@@ -707,11 +713,7 @@ cmd_run() {
       fi
       if ! hunt; then err 'no new route: stopping'; return 1; fi
       ok "new route: $(current_ip) $(current_loc)"
-      resume; rc=$?
-      if [ "$rc" = 2 ] || [ "$rc" = 124 ]; then
-        warn 'the new IP is limited too'
-      fi
-      cont=(--continue)
+      resume_args
       continue
     fi
 
@@ -724,8 +726,7 @@ cmd_run() {
     log "opencode crashed rc=$rc streak=$crash"
     if [ "$crash" -gt 2 ]; then err "opencode crashed $crash times in 10 minutes: stopping"; return 1; fi
     warn "opencode exited with $rc, retrying on the same route"
-    resume >/dev/null 2>&1
-    cont=(--continue)
+    resume_args
   done
 }
 
@@ -834,7 +835,7 @@ EOS
   STATE=$T/state LOG=$T/state/op.log OC_PID=$T/state/oc.pid LIMIT_FLAG=$T/state/limit.flag ROT_HIST=$T/state/rotations
   OC_LOG_DIR=$logd OC=$fake EGRESS=exec EGRESS_CMD=$T/rot.sh TRACE_CMD="cat '$ipf'"
   ROTATE_TRIES=2 ROTATE_COOLDOWN=0 ROUTE_WAIT=3 ROTATE_GATE_MAX=2 WATCH_INTERVAL=0.3
-  PROBE_TIMEOUT=15 RESUME_TIMEOUT=15 FOLDER=$T
+  PROBE_TIMEOUT=15 FOLDER=$T
   init_state
 
   say 36 "OP self-test"

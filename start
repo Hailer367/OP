@@ -17,7 +17,7 @@
 
 set -uo pipefail
 
-OP_VERSION=0.3.0
+OP_VERSION=0.4.0
 SELF=$(readlink -f -- "${BASH_SOURCE[0]}")
 SELF_DIR=$(dirname -- "$SELF")
 
@@ -39,7 +39,15 @@ TRACE_URL=${TRACE_URL:-https://www.cloudflare.com/cdn-cgi/trace}
 GATEWAY_URL=${GATEWAY_URL:-https://opencode.ai/}
 TRACE_CMD=${TRACE_CMD:-}         # override: command that prints the trace text (ip=... loc=...)
 EGRESS_CMD=${EGRESS_CMD:-}       # exec egress: command that makes a new route, prints its proxy url or nothing
-LIMIT_PAT=${LIMIT_PAT:-'free-limit|free usage|usage limit|out of usage|insufficient credits|payment required|quota exceeded|limit reached|rate limit|429'}
+# three classes, like the original: noop never rotates, rotate always does,
+# ask is a transient rate limit and is throttled by ASK_COOLDOWN
+PAT_ROTATE=${PAT_ROTATE:-'free-limit|free usage|usage limit|out of usage|insufficient credits|payment required|quota exceeded|limit reached'}
+PAT_ASK=${PAT_ASK:-'rate limit|too many requests|429'}
+PAT_NOOP=${PAT_NOOP:-'compact|compaction|context length|context window|maximum context|invalid model|model not found'}
+ASK_COOLDOWN=${ASK_COOLDOWN:-600}        # seconds between unattended rate-limit rotations
+RESUME_MODE=${RESUME_MODE:-continue}     # continue | last | custom
+RESUME_TEXT=${RESUME_TEXT:-}
+LOG_MAX_KB=${LOG_MAX_KB:-1024}
 ROTATE_TRIES=${ROTATE_TRIES:-8}          # route attempts per limit
 ROTATE_COOLDOWN=${ROTATE_COOLDOWN:-2}    # seconds between failed attempts
 ROUTE_WAIT=${ROUTE_WAIT:-15}             # seconds a new route may take to answer
@@ -61,6 +69,11 @@ OC_PID=${OC_PID:-$STATE/oc.pid}
 LIMIT_FLAG=${LIMIT_FLAG:-$STATE/limit.flag}
 ROT_HIST=${ROT_HIST:-$STATE/rotations}
 OC_LOG_DIR=${OP_OC_LOG_DIR:-${OC_LOG_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/opencode/log}}
+ASK_LAST=${ASK_LAST:-$STATE/ask.last}
+OC_DATA=${OC_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/opencode}
+AUTH=${AUTH:-$OC_DATA/auth.json}
+AUTH_SNAP=${AUTH_SNAP:-$STATE/auth.json}
+PATTERNS=${PATTERNS:-$(dirname "$CONFIG")/patterns.conf}
 
 RESERVED=" STATE LOG CONFIG OC_PID LIMIT_FLAG ROT_HIST OC_LOG_DIR SELF SELF_DIR METHOD PROXY_URL OC_CMD "
 
@@ -88,11 +101,58 @@ load_config() {
   done <"$CONFIG"
 }
 
+load_patterns() {
+  [ -f "$PATTERNS" ] || return 0
+  local k v line
+  while IFS= read -r line || [ -n "$line" ]; do
+    case $line in ''|'#'*) continue ;; esac
+    k=${line%%=*}; v=${line#*=}
+    case $k in
+      rotate) PAT_ROTATE=$v ;;
+      ask)    PAT_ASK=$v ;;
+      noop)   PAT_NOOP=$v ;;
+    esac
+  done <"$PATTERNS"
+  log "patterns: rotate=${PAT_ROTATE:-none} ask=${PAT_ASK:-none} noop=${PAT_NOOP:-none}"
+}
+
+pat_any() {
+  local p=""
+  [ -n "$PAT_ROTATE" ] && p=$PAT_ROTATE
+  [ -n "$PAT_ASK" ] && p=${p:+$p|}$PAT_ASK
+  printf '%s' "$p"
+}
+
+is_limit_text() {
+  local p; p=$(pat_any)
+  [ -n "$p" ] || return 1
+  printf '%s' "$1" | grep -Eiq "$p"
+}
+
+# rotate | ask | noop, nothing when no class matches. noop is checked first so
+# "context limit reached" does not read as "limit reached".
+classify() {
+  [ -n "$PAT_NOOP" ] && printf '%s' "$1" | grep -Eiq "$PAT_NOOP" && { printf noop; return 0; }
+  [ -n "$PAT_ROTATE" ] && printf '%s' "$1" | grep -Eiq "$PAT_ROTATE" && { printf rotate; return 0; }
+  [ -n "$PAT_ASK" ] && printf '%s' "$1" | grep -Eiq "$PAT_ASK" && { printf ask; return 0; }
+  return 1
+}
+
 init_state() {
   mkdir -p "$STATE" 2>/dev/null
   chmod 700 "$STATE" 2>/dev/null
   touch "$LOG" 2>/dev/null
   chmod 600 "$LOG" 2>/dev/null
+  trim_log
+}
+
+# the log is the only thing that grows forever on a long-lived server
+trim_log() {
+  local max=$((LOG_MAX_KB * 1024)) size
+  [ -f "$LOG" ] || return 0
+  size=$(stat -c%s "$LOG" 2>/dev/null || echo 0)
+  [ "$size" -gt "$max" ] || return 0
+  tail -c "$((max / 2))" "$LOG" >"$LOG.tmp" 2>/dev/null && mv -f "$LOG.tmp" "$LOG"
 }
 
 # ---------------------------------------------------------------- the route
@@ -446,7 +506,7 @@ probe_ip() {
         "reply with the word ok" 2>&1); rc=$?
   sid=$(printf '%s' "$out" | grep -o 'ses_[A-Za-z0-9]*' | head -n1)
   [ -n "$sid" ] && timeout 20 "${OC_CMD[@]}" session delete "$sid" >/dev/null 2>&1
-  if printf '%s' "$out" | grep -Eiq "$LIMIT_PAT"; then return 1; fi
+  if is_limit_text "$out"; then return 1; fi
   [ "$rc" = 0 ] && return 0
   log "probe rc=$rc: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)"
   return 2
@@ -476,7 +536,7 @@ stop_oc() {
 # Only bytes written after the session started are read, so an old limit line in a
 # shared log cannot trigger a rotation.
 watch_log() {
-  local dir=$1 f cur="" pos=0 size chunk
+  local dir=$1 f cur="" pos=0 size chunk line kind now
   local -A base=()
   for f in "$dir"/*.log; do [ -f "$f" ] && base[$f]=$(stat -c%s "$f" 2>/dev/null || echo 0); done
   while :; do
@@ -488,22 +548,83 @@ watch_log() {
     [ "$size" -gt "$pos" ] || continue
     chunk=$(tail -c +$((pos + 1)) "$f" 2>/dev/null)
     pos=$size
-    printf '%s' "$chunk" | grep -Eiq "$LIMIT_PAT" || continue
-    log "limit line in $f: $(printf '%s' "$chunk" | grep -Eim1 "$LIMIT_PAT" | cut -c1-200)"
-    : >"$LIMIT_FLAG"
-    stop_oc
-    return 0
+    while IFS= read -r line; do
+      kind=$(classify "$line") || continue
+      log "watch: $kind line in $(basename "$f"): $(printf '%s' "$line" | cut -c1-160)"
+      case $kind in
+        noop) continue ;;
+        rotate) printf 'rotate\n' >"$LIMIT_FLAG"; stop_oc; return 0 ;;
+        ask)
+          # a 429 is usually transient; rotating on every one burns the whole pool
+          now=$(date +%s)
+          if [ "$ASK" != 1 ] && [ $((now - $(cat "$ASK_LAST" 2>/dev/null || echo 0))) -lt "$ASK_COOLDOWN" ]; then
+            log 'watch: rate limit inside the cooldown, ignored'
+            continue
+          fi
+          date +%s >"$ASK_LAST"
+          printf 'ask\n' >"$LIMIT_FLAG"; stop_oc; return 0
+          ;;
+      esac
+    done < <(printf '%s\n' "$chunk")
   done
 }
 
+# The login must survive a rotation or a crash. A copy is kept; if auth.json
+# disappears, it is put back instead of sending the user through a login.
+token_guard() {
+  if [ -e "$AUTH" ]; then
+    [ "$(stat -c%s "$AUTH" 2>/dev/null || echo 0)" -ge 3 ] || return 0
+    (umask 077; cp -f "$AUTH" "$AUTH_SNAP" 2>/dev/null) && chmod 600 "$AUTH_SNAP" 2>/dev/null
+  elif [ -s "$AUTH_SNAP" ]; then
+    mkdir -p "$OC_DATA" 2>/dev/null
+    cp -f "$AUTH_SNAP" "$AUTH" 2>/dev/null && chmod 600 "$AUTH" 2>/dev/null
+    warn 'auth.json had disappeared; restored from the OP copy'
+    log 'token guard: restored auth.json'
+  fi
+}
+
+# the last real message in the chat, minus the resume messages themselves
+last_user_message() {
+  local sid j
+  sid=$(timeout 20 "${OC_CMD[@]}" session list --format json -n 1 2>/dev/null \
+        | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\(ses_[A-Za-z0-9]*\)".*/\1/p' | head -n1)
+  [ -n "$sid" ] || return 1
+  j=$(timeout 30 "${OC_CMD[@]}" session export "$sid" 2>/dev/null)
+  [ -n "$j" ] || return 1
+  if have jq; then
+    printf '%s' "$j" | jq -r --arg m "$RESUME_MSG" --arg t "$RESUME_TEXT" \
+      '[.messages[] | select(.type=="user") | .text | select(. != $m and . != $t)] | last // empty' 2>/dev/null
+  elif have python3; then
+    printf '%s' "$j" | RESUME_MSG="$RESUME_MSG" RESUME_TEXT="$RESUME_TEXT" python3 -c '
+import json,os,sys
+skip={os.environ.get("RESUME_MSG",""),os.environ.get("RESUME_TEXT","")}
+d=json.load(sys.stdin)
+u=[m.get("text") for m in d.get("messages",[]) if m.get("type")=="user" and m.get("text") and m.get("text") not in skip]
+print(u[-1] if u else "")' 2>/dev/null
+  else
+    return 1
+  fi
+}
+
+resume_message() {
+  local m=""
+  case $RESUME_MODE in
+    custom) [ -n "$RESUME_TEXT" ] && m=$RESUME_TEXT ;;
+    last)   m=$(last_user_message) || m="" ;;
+  esac
+  [ -n "$m" ] || m=$RESUME_MSG
+  printf '%s' "$(printf '%s' "$m" | tr '\n' ' ' | cut -c1-2000)"
+}
+
 resume() {
-  local out rc msg=$RESUME_MSG auto=()
+  local out rc msg auto=()
   [ "$AUTO_CONTINUE" = 1 ] && auto=(--auto)
   export_proxy
-  log "resume: ip=$(current_ip) msg=$msg"
+  msg=$(resume_message)
+  log "resume: ip=$(current_ip) mode=$RESUME_MODE msg=$msg"
   out=$(cd "$FOLDER" && timeout -k 5 "$RESUME_TIMEOUT" "${OC_CMD[@]}" run "${auto[@]}" -c "$msg" 2>&1); rc=$?
   printf '%s\n' "$out" | tail -n 6
-  if printf '%s' "$out" | grep -Eiq "$LIMIT_PAT"; then return 2; fi
+  if is_limit_text "$out"; then return 2; fi
   return $rc
 }
 
@@ -528,10 +649,11 @@ cmd_run() {
   dim "log      $LOG"
   echo
 
-  local rc tpid wpid cont=() crash=0 crash_last=0 now
+  local rc tpid wpid cont=() crash=0 crash_last=0 now kind a
   while :; do
     rm -f "$LIMIT_FLAG"
     : >"$OC_PID"
+    token_guard
     export_proxy
     watch_log "$OC_LOG_DIR" & wpid=$!
     # background + wait: a killed foreground job makes bash print "Terminated" over the TUI
@@ -542,17 +664,17 @@ cmd_run() {
     : >"$OC_PID"
 
     if [ -f "$LIMIT_FLAG" ]; then
-      rm -f "$LIMIT_FLAG"
+      kind=$(cat "$LIMIT_FLAG" 2>/dev/null); rm -f "$LIMIT_FLAG"
       echo
-      warn 'limit hit'
+      warn "limit hit${kind:+ ($kind)}"
+      if [ "$kind" = ask ] && [ "$ASK" = 1 ]; then
+        a=""; printf '  rate limit, rotate the IP now? [Y/n] '
+        IFS= read -r -t 60 a || true
+        [[ ${a,,} == n* ]] && { cont=(--continue); continue; }
+      fi
       if ! rot_gate; then
         err "$ROTATE_GATE_MAX rotations in $((ROTATE_GATE_WINDOW / 60)) minutes: stopping so it does not loop"
         return 1
-      fi
-      if [ "$ASK" = 1 ]; then
-        local a=""; printf '  rotate the IP now? [Y/n] '
-        IFS= read -r -t 60 a || true
-        [[ ${a,,} == n* ]] && { cont=(--continue); continue; }
       fi
       if ! hunt; then err 'no new route: stopping'; return 1; fi
       ok "new route: $(current_ip) $(current_loc)"
@@ -693,9 +815,9 @@ EOS
 
   local rotations; rotations=$(( $(cat "$counter") - 1 ))
   local resumes;   resumes=$(grep -c 'resume: ip=' "$LOG" 2>/dev/null || true)
-  local limits;    limits=$(grep -c 'limit line in' "$LOG" 2>/dev/null || true)
+  local limits;    limits=$(grep -c 'watch: rotate' "$LOG" 2>/dev/null || true)
   echo
-  printf '  limit detected   %s\n' "$limits"
+  printf '  rotate lines     %s\n' "$limits"
   printf '  rotations        %s (expect 3)\n' "$rotations"
   printf '  resumes          %s (expect 2)\n' "$resumes"
   printf '  exit             %s (expect 1, loop guard)\n' "$rc"
@@ -736,6 +858,7 @@ main() {
   esac
 
   load_config
+  load_patterns
   init_state
 
   if [ "${DRY:-0}" = 1 ]; then

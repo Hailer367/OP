@@ -91,6 +91,43 @@ It prints the HTTP proxy URL it created, or nothing when the host route changed.
 Only then does OP resume: `opencode run --auto -c continue`, then the TUI reopens
 with `--continue`.
 
+## What counts as a limit
+
+Three classes, matched against new log lines. `noop` is checked first, so a
+context-length error never reads as `limit reached`.
+
+| class | default matches | what OP does |
+|---|---|---|
+| `noop` | compaction, context length, invalid model | nothing, keeps watching |
+| `rotate` | free-limit, usage limit, quota, credits | rotates |
+| `ask` | rate limit, 429 | rotates, but at most once per `ASK_COOLDOWN` (600s) |
+
+A transient 429 is not a used-up free tier. Rotating on every one burns the whole
+pool and interrupts you for nothing, so `ask` is throttled. Override the classes in
+`~/.config/op/patterns.conf`:
+
+```
+rotate=free-limit|usage limit|quota
+ask=rate limit|429
+noop=compact|context length
+```
+
+An empty value disables that class entirely.
+
+## Resume
+
+`RESUME_MODE` decides what is sent to nudge the chat forward:
+
+- `continue` (default) — the literal `RESUME_MSG`.
+- `last` — your last real message, read from the session export. The resume
+  messages themselves are skipped, so it cannot loop on its own text.
+- `custom` — `RESUME_TEXT`.
+
+## Login
+
+OP keeps a copy of `auth.json` in the state directory and restores it if it
+disappears. A rotation or a crash cannot log you out.
+
 ## Loop guard
 
 `ROTATE_GATE_MAX` rotations (default 5) per `ROTATE_GATE_WINDOW` (default 30 min).

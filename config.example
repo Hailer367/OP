@@ -33,5 +33,17 @@ RESUME_TIMEOUT=180
 # ask before rotating (0 = rotate by itself)
 ASK=0
 
-# what counts as a limit in the opencode log
-LIMIT_PAT=free-limit|free usage|usage limit|out of usage|insufficient credits|payment required|quota exceeded|limit reached|rate limit|429
+# what counts as a limit in the opencode log (three classes, noop wins)
+PAT_ROTATE=free-limit|free usage|usage limit|out of usage|insufficient credits|payment required|quota exceeded|limit reached
+PAT_ASK=rate limit|too many requests|429
+PAT_NOOP=compact|compaction|context length|context window|maximum context|invalid model|model not found
+
+# seconds between unattended rate-limit rotations
+ASK_COOLDOWN=600
+
+# continue | last | custom
+RESUME_MODE=continue
+RESUME_TEXT=
+
+# cap the activity log
+LOG_MAX_KB=1024

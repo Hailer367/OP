@@ -55,7 +55,7 @@ ROTATE_GATE_MAX=${ROTATE_GATE_MAX:-5}    # rotations allowed per ROTATE_GATE_WIN
 ROTATE_GATE_WINDOW=${ROTATE_GATE_WINDOW:-1800}  # seconds
 PROBE=${PROBE:-1}                        # 1 = prove the new IP with a throwaway chat
 PROBE_TIMEOUT=${PROBE_TIMEOUT:-120}
-RESUME_MSG=${RESUME_MSG:-continue}       # message that nudges the chat forward
+RESUME_MSG=${RESUME_MSG:-Continue}       # message that nudges the chat forward
 RESUME_TIMEOUT=${RESUME_TIMEOUT:-180}
 WATCH_INTERVAL=${WATCH_INTERVAL:-1}      # seconds between log polls
 AUTO_CONTINUE=${AUTO_CONTINUE:-1}        # resume with --auto (no permission prompts in the resumed turn)

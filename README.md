@@ -118,7 +118,7 @@ An empty value disables that class entirely.
 
 `RESUME_MODE` decides what is sent to nudge the chat forward:
 
-- `continue` (default) — the literal `RESUME_MSG`.
+- `continue` (default) — the literal `RESUME_MSG`, which is `Continue`.
 - `last` — your last real message, read from the session export. The resume
   messages themselves are skipped, so it cannot loop on its own text.
 - `custom` — `RESUME_TEXT`.

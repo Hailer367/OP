@@ -27,7 +27,7 @@ PROBE=1
 PROBE_TIMEOUT=120
 
 # what the resumed turn is nudged with
-RESUME_MSG=continue
+RESUME_MSG=Continue
 RESUME_TIMEOUT=180
 
 # ask before rotating (0 = rotate by itself)

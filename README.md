@@ -6,8 +6,20 @@ OP runs the OpenCode TUI in a folder. When the provider answers with a limit, it
 swaps the exit IP, checks the new route can actually reach the gateway, proves it
 with a throwaway session, and resumes the same chat.
 
-One file, `./start`. bash + curl + opencode. Linux only, no build step, no daemon,
-no dependencies to install.
+One file, `./start`. bash + curl + opencode. Linux only, no build step.
+
+## First run
+
+```bash
+./start
+```
+
+If Cloudflare WARP is missing, OP installs it (apt or dnf), starts `warp-svc`,
+registers the client, switches it to proxy mode and connects — then opens the chat
+on that route. No flags, no config, no setup step.
+
+That needs root or passwordless sudo. Without it OP says so once and keeps working
+on whatever egress is available. `AUTO_INSTALL=0` turns the install off.
 
 ## Use
 
@@ -24,7 +36,8 @@ Flags: `--folder DIR`, `--egress auto|warp|tor|proxy|exec|none`, `--no-probe`,
 
 ## Egress
 
-`auto` picks the first method that comes up: WARP, then TOR, then a proxy list.
+`auto` (the default) installs WARP if needed, brings it up, and only falls back to
+TOR or a proxy list when WARP cannot be used.
 
 | method | needs | rotation |
 |---|---|---|

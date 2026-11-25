@@ -4,6 +4,9 @@
 # auto | warp | tor | proxy | exec | none
 EGRESS=auto
 
+# install Cloudflare WARP on first run when it is missing (needs root or sudo)
+AUTO_INSTALL=1
+
 # path to the opencode binary (a .js path is run with node)
 OC=opencode
 

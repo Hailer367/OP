@@ -17,12 +17,13 @@
 
 set -uo pipefail
 
-OP_VERSION=0.2.0
+OP_VERSION=0.3.0
 SELF=$(readlink -f -- "${BASH_SOURCE[0]}")
 SELF_DIR=$(dirname -- "$SELF")
 
 # ---------------------------------------------------------------- defaults
 WARP_TOS=(); WARP_NEW=0
+AUTO_INSTALL=${AUTO_INSTALL:-1}   # 1 = install Cloudflare WARP on first run when it is missing
 EGRESS=${EGRESS:-auto}           # auto | warp | tor | proxy | exec | none
 OC=${OC:-opencode}               # path to the opencode binary (a .js path is run with node)
 FOLDER=${FOLDER:-$PWD}           # folder the chat lives in
@@ -140,6 +141,54 @@ port_wait() {
 # warp-cli needs the warp-svc daemon, which needs root (or passwordless sudo).
 # The CLI changed syntax: 2023+ has "mode proxy" / "proxy port", older builds have
 # "set-mode" / "set-proxy-port". Both are handled.
+# run something as root without ever prompting for a password
+warp_root() {
+  if [ "$(id -u)" -eq 0 ]; then "$@"
+  elif have sudo && sudo -n true 2>/dev/null; then sudo -n "$@"
+  else return 1; fi
+}
+
+warp_install_apt() {
+  local codename
+  codename=$(. /etc/os-release 2>/dev/null; printf '%s' "${VERSION_CODENAME:-stable}")
+  have gpg || warp_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gnupg >>"$LOG" 2>&1
+  curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg 2>>"$LOG" \
+    | warp_root gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg >>"$LOG" 2>&1 || return 1
+  printf 'deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ %s main\n' "$codename" \
+    | warp_root tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null || return 1
+  warp_root env DEBIAN_FRONTEND=noninteractive apt-get update -qq >>"$LOG" 2>&1
+  warp_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq cloudflare-warp >>"$LOG" 2>&1
+  have warp-cli
+}
+
+warp_install_rpm() {
+  curl -fsSL https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo 2>>"$LOG" \
+    | warp_root tee /etc/yum.repos.d/cloudflare-warp.repo >/dev/null || return 1
+  warp_root "$1" install -y cloudflare-warp >>"$LOG" 2>&1
+  have warp-cli
+}
+
+# first run convenience: install WARP when it is missing and we can be root
+warp_install() {
+  have warp-cli && return 0
+  if [ "${AUTO_INSTALL:-1}" != 1 ]; then log 'warp missing, auto-install off'; return 1; fi
+  if ! warp_root true; then
+    warn 'WARP is not installed; installing it needs root (sudo ./start)'
+    log 'warp missing, no root'
+    return 1
+  fi
+  say 36 '  installing Cloudflare WARP (one time)'
+  local got=0
+  if have apt-get; then warp_install_apt && got=1
+  elif have dnf; then warp_install_rpm dnf && got=1
+  elif have yum; then warp_install_rpm yum && got=1
+  fi
+  if [ "$got" = 1 ] && have warp-cli; then ok 'WARP installed'; return 0; fi
+  warn 'could not install WARP automatically'
+  log 'warp install failed'
+  return 1
+}
+
 warp_installed() { have warp-cli; }
 
 warp_cli() {  # root, passwordless sudo, or the user's own daemon socket; never prompts
@@ -157,14 +206,23 @@ warp_detect() {
   log "warp: tos=${WARP_TOS[*]:-none} syntax=$([ "$WARP_NEW" = 1 ] && echo new || echo old)"
 }
 
+warp_svc_direct() {
+  pgrep -x warp-svc >/dev/null 2>&1 && return 0
+  [ -x /usr/bin/warp-svc ] || return 1
+  warp_root sh -c 'nohup /usr/bin/warp-svc >/var/log/warp-svc.log 2>&1 &' || return 1
+  local i
+  for ((i = 0; i < 10; i++)); do pgrep -x warp-svc >/dev/null 2>&1 && return 0; sleep 1; done
+  return 1
+}
+
 warp_svc_up() {
-  have systemctl || return 0
-  systemctl is-active --quiet warp-svc 2>/dev/null && return 0
-  if [ "$(id -u)" -eq 0 ]; then systemctl enable --now warp-svc >>"$LOG" 2>&1
-  elif have sudo && sudo -n true 2>/dev/null; then sudo -n systemctl enable --now warp-svc >>"$LOG" 2>&1
-  else return 1; fi
-  sleep 2
-  systemctl is-active --quiet warp-svc 2>/dev/null
+  if have systemctl && systemctl is-active --quiet warp-svc 2>/dev/null; then return 0; fi
+  if have systemctl; then
+    warp_root systemctl enable --now warp-svc >>"$LOG" 2>&1
+    sleep 2
+    systemctl is-active --quiet warp-svc 2>/dev/null && return 0
+  fi
+  warp_svc_direct
 }
 
 # "Disconnected" must not read as connected
@@ -295,6 +353,7 @@ resolve_method() {
   case $EGRESS in
     auto)
       METHOD=none; PROXY_URL=""
+      warp_installed || warp_install
       if warp_installed; then
         warp_detect
         if warp_up; then METHOD=warp; fi
@@ -302,7 +361,7 @@ resolve_method() {
       if [ "$METHOD" = none ] && have tor && have privoxy && tor_start; then METHOD=tor; fi
       if [ "$METHOD" = none ] && proxy_pick; then METHOD=proxy; fi
       ;;
-    warp)  warp_detect; if ! warp_up; then log 'warp did not come up'; METHOD=none; PROXY_URL=""; fi ;;
+    warp)  warp_installed || warp_install; warp_detect; if ! warp_up; then log 'warp did not come up'; METHOD=none; PROXY_URL=""; fi ;;
     tor)   tor_start || { log 'tor did not come up'; METHOD=none; PROXY_URL=""; } ;;
     proxy) proxy_pick || { log 'no proxy answered'; METHOD=none; PROXY_URL=""; } ;;
     exec)  exec_up  || { log 'egress command failed'; METHOD=none; PROXY_URL=""; } ;;

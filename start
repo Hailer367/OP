@@ -1,0 +1,638 @@
+#!/usr/bin/env bash
+# OP - OpenCode, but it does not stop when the free tier does.
+#
+# Runs the OpenCode TUI in a folder. When the provider answers with a limit,
+# OP swaps the exit IP, checks the new route can actually reach the gateway,
+# proves it with a throwaway session, and resumes the same chat.
+#
+# One file. bash + curl + opencode. Linux only.
+#
+#   ./start                 run in the current folder
+#   ./start status          show route, exit IP, log paths
+#   ./start rotate          get a new exit IP and print it
+#   ./start test            offline self-test of the whole loop
+#   ./start help            all flags
+#
+# License: MIT
+
+set -uo pipefail
+
+OP_VERSION=0.1.0
+SELF=$(readlink -f -- "${BASH_SOURCE[0]}")
+SELF_DIR=$(dirname -- "$SELF")
+
+# ---------------------------------------------------------------- defaults
+EGRESS=${EGRESS:-auto}           # auto | warp | tor | proxy | exec | none
+OC=${OC:-opencode}               # path to the opencode binary (a .js path is run with node)
+FOLDER=${FOLDER:-$PWD}           # folder the chat lives in
+PROXY_LIST=${PROXY_LIST:-}       # url or file, any text: every ip:port in it is a candidate
+PROXY_TRY_MAX=${PROXY_TRY_MAX:-40}      # proxies probed per rotation
+PROXY_TIMEOUT=${PROXY_TIMEOUT:-8}       # seconds per proxy probe
+WARP_PORT=${WARP_PORT:-40000}           # warp-cli proxy port
+WARP_WAIT=${WARP_WAIT:-15}              # seconds to wait for WARP to connect
+TOR_SOCKS=${TOR_SOCKS:-9050}
+TOR_HTTP=${TOR_HTTP:-8118}
+TOR_WAIT=${TOR_WAIT:-45}                # seconds to wait for the tor bootstrap
+TRACE_URL=${TRACE_URL:-https://www.cloudflare.com/cdn-cgi/trace}
+GATEWAY_URL=${GATEWAY_URL:-https://opencode.ai/}
+TRACE_CMD=${TRACE_CMD:-}         # override: command that prints the trace text (ip=... loc=...)
+EGRESS_CMD=${EGRESS_CMD:-}       # exec egress: command that makes a new route, prints its proxy url or nothing
+LIMIT_PAT=${LIMIT_PAT:-'free-limit|free usage|usage limit|out of usage|insufficient credits|payment required|quota exceeded|limit reached|rate limit|429'}
+ROTATE_TRIES=${ROTATE_TRIES:-8}          # route attempts per limit
+ROTATE_COOLDOWN=${ROTATE_COOLDOWN:-2}    # seconds between failed attempts
+ROUTE_WAIT=${ROUTE_WAIT:-15}             # seconds a new route may take to answer
+ROTATE_GATE_MAX=${ROTATE_GATE_MAX:-5}    # rotations allowed per ROTATE_GATE_WINDOW
+ROTATE_GATE_WINDOW=${ROTATE_GATE_WINDOW:-1800}  # seconds
+PROBE=${PROBE:-1}                        # 1 = prove the new IP with a throwaway chat
+PROBE_TIMEOUT=${PROBE_TIMEOUT:-120}
+RESUME_MSG=${RESUME_MSG:-continue}       # message that nudges the chat forward
+RESUME_TIMEOUT=${RESUME_TIMEOUT:-180}
+WATCH_INTERVAL=${WATCH_INTERVAL:-1}      # seconds between log polls
+AUTO_CONTINUE=${AUTO_CONTINUE:-1}        # resume with --auto (no permission prompts in the resumed turn)
+ASK=${ASK:-0}                            # 1 = ask before rotating (0 = rotate by itself)
+CONFIG=${OP_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/op/config}
+
+# ---------------------------------------------------------------- state
+STATE=${OP_STATE:-${STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/op}}
+LOG=${LOG:-$STATE/op.log}
+OC_PID=${OC_PID:-$STATE/oc.pid}
+LIMIT_FLAG=${LIMIT_FLAG:-$STATE/limit.flag}
+ROT_HIST=${ROT_HIST:-$STATE/rotations}
+OC_LOG_DIR=${OP_OC_LOG_DIR:-${OC_LOG_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/opencode/log}}
+
+RESERVED=" STATE LOG CONFIG OC_PID LIMIT_FLAG ROT_HIST OC_LOG_DIR SELF SELF_DIR METHOD PROXY_URL OC_CMD "
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"$LOG" 2>/dev/null; }
+say()  { printf '\033[%sm%s\033[0m\n' "$1" "$2"; }
+ok()   { say 32 "  $*"; }
+warn() { say 33 "  $*"; }
+err()  { say 31 "  $*"; }
+dim()  { say 90 "  $*"; }
+
+shuffle() { if have shuf; then shuf; else awk 'BEGIN{srand()} {print rand()"\t"$0}' | sort -n | cut -f2-; fi; }
+
+load_config() {
+  [ -f "$CONFIG" ] || return 0
+  local k v line
+  while IFS= read -r line || [ -n "$line" ]; do
+    case $line in ''|'#'*) continue ;; esac
+    k=${line%%=*}; v=${line#*=}
+    k=$(printf '%s' "$k" | tr -d '[:space:]')
+    [[ $k =~ ^[A-Z_][A-Z0-9_]*$ ]] || continue
+    case $RESERVED in *" $k "*) continue ;; esac
+    printf -v "$k" '%s' "$v"
+  done <"$CONFIG"
+}
+
+init_state() {
+  mkdir -p "$STATE" 2>/dev/null
+  chmod 700 "$STATE" 2>/dev/null
+  touch "$LOG" 2>/dev/null
+  chmod 600 "$LOG" 2>/dev/null
+}
+
+# ---------------------------------------------------------------- the route
+export_proxy() {
+  # loopback must never go through the tunnel, or a rotation cuts the proxy off from itself
+  export NO_PROXY=localhost,127.0.0.1,::1 no_proxy=localhost,127.0.0.1,::1
+  if [ -n "${PROXY_URL:-}" ]; then
+    export HTTP_PROXY=$PROXY_URL HTTPS_PROXY=$PROXY_URL ALL_PROXY=$PROXY_URL \
+           http_proxy=$PROXY_URL https_proxy=$PROXY_URL all_proxy=$PROXY_URL
+  else
+    unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
+  fi
+}
+
+trace() {
+  if [ -n "$TRACE_CMD" ]; then eval "$TRACE_CMD" 2>/dev/null; return; fi
+  local args=()
+  [ -n "${PROXY_URL:-}" ] && args=(-x "$PROXY_URL")
+  curl -s -m 15 "${args[@]}" "$TRACE_URL" 2>/dev/null
+}
+current_ip()  { trace | sed -n 's/^ip=//p' | head -n1; }
+current_loc() { trace | sed -n 's/^loc=//p' | head -n1; }
+
+# The trace answering is not the gateway answering. A route that fails TLS here
+# fails the chat a minute later with "SSL handshake failed ... net_error -202".
+gateway_ok() {
+  local args=() code
+  [ -n "${PROXY_URL:-}" ] && args=(-x "$PROXY_URL")
+  code=$(curl -s -o /dev/null -m 12 -w '%{http_code}' "${args[@]}" "$GATEWAY_URL" 2>/dev/null)
+  case $code in 2*|3*|401|403|404) return 0 ;; esac
+  log "gateway probe: HTTP $code"
+  return 1
+}
+
+port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+port_wait() {
+  local i
+  for ((i = 0; i < $3; i++)); do
+    if port_open "$1"; then [ "$2" = up ] && return 0; else [ "$2" = down ] && return 0; fi
+    sleep 1
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------- egress: WARP
+warp_installed() { have warp-cli; }
+warp_cli() {
+  if [ "$(id -u)" -eq 0 ]; then timeout 30 warp-cli --accept-tos "$@"
+  else timeout 30 sudo -n warp-cli --accept-tos "$@"; fi
+}
+warp_run() { warp_cli "$@" >>"$LOG" 2>&1; }
+
+warp_up() {
+  warp_installed || return 1
+  warp_run registration show >/dev/null 2>&1 || warp_run registration new || return 1
+  warp_run mode proxy; warp_run proxy port "$WARP_PORT"; warp_run connect
+  local i
+  for ((i = 0; i < WARP_WAIT; i++)); do
+    warp_cli status 2>/dev/null | grep -qi connected && break
+    sleep 1
+  done
+  PROXY_URL="http://127.0.0.1:$WARP_PORT"
+  gateway_ok
+}
+warp_rotate() {
+  warp_installed || return 1
+  warp_run registration delete
+  warp_run registration new || return 1
+  warp_up
+}
+
+# ---------------------------------------------------------------- egress: TOR
+tor_start() {
+  have tor && have privoxy || return 1
+  if ! port_open "$TOR_SOCKS"; then
+    : >"$STATE/tor.log"
+    tor --SocksPort "127.0.0.1:$TOR_SOCKS" --DataDirectory "$STATE/tor" \
+        --Log "notice file $STATE/tor.log" >/dev/null 2>&1 &
+    echo $! >"$STATE/tor.pid"
+    local i
+    for ((i = 0; i < TOR_WAIT; i++)); do
+      grep -q 'Bootstrapped 100%' "$STATE/tor.log" 2>/dev/null && break
+      sleep 1
+    done
+  fi
+  printf 'listen-address 127.0.0.1:%s\nforward-socks5t / 127.0.0.1:%s .\n' "$TOR_HTTP" "$TOR_SOCKS" >"$STATE/privoxy.conf"
+  if ! port_open "$TOR_HTTP"; then
+    privoxy --no-daemon "$STATE/privoxy.conf" >/dev/null 2>&1 &
+    echo $! >"$STATE/privoxy.pid"
+    port_wait "$TOR_HTTP" up 10
+  fi
+  PROXY_URL="http://127.0.0.1:$TOR_HTTP"
+  gateway_ok
+}
+tor_stop() {
+  local tp
+  tp=$(cat "$STATE/tor.pid" 2>/dev/null)
+  if [ -n "$tp" ] && tr '\0' ' ' <"/proc/$tp/cmdline" 2>/dev/null | grep -q "DataDirectory $STATE/tor"; then
+    kill "$tp" 2>/dev/null
+  fi
+  pkill -f "DataDirectory $STATE/tor" 2>/dev/null
+  rm -f "$STATE/tor.pid"
+}
+tor_rotate() { tor_stop; port_wait "$TOR_SOCKS" down 5; tor_start; }
+
+# ---------------------------------------------------------------- egress: PROXY list
+proxy_pick() {
+  [ -n "$PROXY_LIST" ] || return 1
+  local raw list p n=0 t ip
+  if [ -f "$PROXY_LIST" ]; then raw=$(cat "$PROXY_LIST" 2>/dev/null)
+  else raw=$(curl -s -m 20 "$PROXY_LIST" 2>/dev/null); fi
+  list=$(printf '%s' "$raw" | grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}:[0-9]{2,5}' | sort -u | shuffle | head -n "$PROXY_TRY_MAX")
+  [ -n "$list" ] || { log 'proxy list empty'; return 1; }
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    n=$((n + 1)); [ "$n" -gt "$PROXY_TRY_MAX" ] && break
+    t=$(curl -s -m "$PROXY_TIMEOUT" -x "http://$p" "$TRACE_URL" 2>/dev/null)
+    ip=$(printf '%s' "$t" | sed -n 's/^ip=//p')
+    [ -n "$ip" ] || continue
+    PROXY_URL="http://$p"
+    gateway_ok && { log "proxy $p -> $ip"; return 0; }
+    PROXY_URL=""
+  done <<<"$list"
+  return 1
+}
+
+# ---------------------------------------------------------------- egress: exec
+# A command of your own that builds the tunnel (wireguard, ssh -D, mullvad, ...).
+# It prints the HTTP proxy URL it created, or nothing when the host route changed.
+exec_up() {
+  [ -n "$EGRESS_CMD" ] || return 1
+  local u
+  u=$("$SHELL" -c "$EGRESS_CMD" 2>>"$LOG")
+  PROXY_URL=$(printf '%s' "$u" | tr -d '[:space:]')
+  gateway_ok
+}
+exec_rotate() { exec_up; }
+
+# ---------------------------------------------------------------- egress control
+resolve_method() {
+  METHOD=$EGRESS
+  case $EGRESS in
+    auto)
+      if warp_installed && warp_up; then METHOD=warp
+      elif have tor && have privoxy && tor_start; then METHOD=tor
+      elif proxy_pick; then METHOD=proxy
+      else METHOD=none; PROXY_URL=""; fi
+      ;;
+    warp)  METHOD=warp;  warp_up  || { log 'warp did not come up'; METHOD=none; PROXY_URL=""; } ;;
+    tor)   METHOD=tor;   tor_start || { log 'tor did not come up'; METHOD=none; PROXY_URL=""; } ;;
+    proxy) METHOD=proxy; proxy_pick || { log 'no proxy answered'; METHOD=none; PROXY_URL=""; } ;;
+    exec)  METHOD=exec;  exec_up  || { log 'egress command failed'; METHOD=none; PROXY_URL=""; } ;;
+    none)  METHOD=none; PROXY_URL="" ;;
+    *)     err "unknown egress: $EGRESS"; exit 2 ;;
+  esac
+  log "egress=$METHOD proxy=${PROXY_URL:-direct}"
+}
+
+egress_rotate() {
+  case $METHOD in
+    warp)  warp_rotate ;;
+    tor)   tor_rotate ;;
+    proxy) proxy_pick ;;
+    exec)  exec_rotate ;;
+    *)     return 1 ;;
+  esac
+}
+
+# ---------------------------------------------------------------- hunt
+rot_gate() {
+  local now t keep=()
+  now=$(date +%s)
+  if [ -f "$ROT_HIST" ]; then
+    while read -r t; do
+      [[ $t =~ ^[0-9]+$ ]] && [ $((now - t)) -lt "$ROTATE_GATE_WINDOW" ] && keep+=("$t")
+    done <"$ROT_HIST"
+  fi
+  [ "${#keep[@]}" -ge "$ROTATE_GATE_MAX" ] && return 1
+  keep+=("$now")
+  printf '%s\n' "${keep[@]}" >"$ROT_HIST"
+}
+
+# hunt: rotate until a route answers the trace, finishes TLS with the gateway,
+# shows a different exit IP, and (with PROBE=1) survives a throwaway chat.
+hunt() {
+  [ "$METHOD" = none ] && { err 'egress is none: nothing to rotate'; return 1; }
+  local prev ip loc i t start same=0
+  prev=$(current_ip)
+  start=$(date +%s)
+  for ((i = 1; i <= ROTATE_TRIES; i++)); do
+    printf '  [%d/%d] rotating...\n' "$i" "$ROTATE_TRIES"
+    if ! egress_rotate; then warn 'rotation failed'; log 'rotate failed'; sleep "$ROTATE_COOLDOWN"; continue; fi
+    ip=""
+    local end=$((SECONDS + ROUTE_WAIT))
+    while :; do
+      t=$(trace); ip=$(printf '%s' "$t" | sed -n 's/^ip=//p'); loc=$(printf '%s' "$t" | sed -n 's/^loc=//p')
+      [ -n "$ip" ] && break
+      [ "$SECONDS" -ge "$end" ] && break
+      sleep 1
+    done
+    if [ -z "$ip" ]; then warn 'route not answering'; log 'rotate route_down'; sleep "$ROTATE_COOLDOWN"; continue; fi
+    if ! gateway_ok; then warn 'route answers the trace but fails TLS to the gateway'; log 'rotate tls_broken'; sleep "$ROTATE_COOLDOWN"; continue; fi
+    ok "exit IP $ip (${loc:-??}) in $(( $(date +%s) - start ))s"
+    if [ -n "$prev" ] && [ "$ip" = "$prev" ]; then
+      same=$((same + 1)); warn "same IP as before ($same/$ROTATE_TRIES)"
+      [ "$same" -ge "$ROTATE_TRIES" ] && { err 'rotation keeps returning the same IP'; log 'rotate same_ip'; return 1; }
+      sleep "$ROTATE_COOLDOWN"; continue
+    fi
+    same=0
+    if [ "$PROBE" = 1 ]; then
+      probe_ip; case $? in
+        0) log "rotate accepted ip=$ip"; return 0 ;;
+        1) warn 'IP is already limited, rotating again'; log "rotate burned ip=$ip"; prev=$ip; sleep "$ROTATE_COOLDOWN"; continue ;;
+        *) warn 'probe could not answer (not a limit): keeping the route'; log "rotate probe_broken ip=$ip"; return 0 ;;
+      esac
+    fi
+    log "rotate accepted ip=$ip"; return 0
+  done
+  err "no usable route after $ROTATE_TRIES attempts"
+  return 1
+}
+
+# probe_ip: 0 usable, 1 limited, 2 the probe itself is broken.
+# --standalone matters: the shared server ignores the proxy env, so without it
+# the probe would test the old route instead of the new one.
+probe_ip() {
+  [ "$PROBE" = 1 ] || return 0
+  local out rc sid
+  export_proxy
+  out=$(cd "$HOME" && timeout -k 5 "$PROBE_TIMEOUT" "${OC_CMD[@]}" run --format json --standalone --archived \
+        "reply with the word ok" 2>&1); rc=$?
+  sid=$(printf '%s' "$out" | grep -o 'ses_[A-Za-z0-9]*' | head -n1)
+  [ -n "$sid" ] && timeout 20 "${OC_CMD[@]}" session delete "$sid" >/dev/null 2>&1
+  if printf '%s' "$out" | grep -Eiq "$LIMIT_PAT"; then return 1; fi
+  [ "$rc" = 0 ] && return 0
+  log "probe rc=$rc: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)"
+  return 2
+}
+
+# ---------------------------------------------------------------- opencode
+oc_cmd() {
+  case $OC in
+    *.js|*.mjs|*.cjs) OC_CMD=(node "$OC") ;;
+    *)                OC_CMD=("$OC") ;;
+  esac
+}
+
+stop_oc() {
+  local p
+  [ -s "$OC_PID" ] || return 0
+  p=$(cat "$OC_PID" 2>/dev/null)
+  [[ $p =~ ^[0-9]+$ ]] || return 0
+  kill "$p" 2>/dev/null
+  local i
+  for ((i = 0; i < 10; i++)); do kill -0 "$p" 2>/dev/null || return 0; sleep 0.2; done
+  kill -9 "$p" 2>/dev/null
+  return 0
+}
+
+# watch_log: poll the newest opencode log; on a limit line, flag it and stop the TUI.
+# Only bytes written after the session started are read, so an old limit line in a
+# shared log cannot trigger a rotation.
+watch_log() {
+  local dir=$1 f cur="" pos=0 size chunk
+  local -A base=()
+  for f in "$dir"/*.log; do [ -f "$f" ] && base[$f]=$(stat -c%s "$f" 2>/dev/null || echo 0); done
+  while :; do
+    sleep "$WATCH_INTERVAL"
+    f=$(ls -t "$dir"/*.log 2>/dev/null | head -n1)
+    [ -n "$f" ] || continue
+    if [ "$f" != "$cur" ]; then cur=$f; pos=${base[$f]:-0}; fi
+    size=$(stat -c%s "$f" 2>/dev/null || echo 0)
+    [ "$size" -gt "$pos" ] || continue
+    chunk=$(tail -c +$((pos + 1)) "$f" 2>/dev/null)
+    pos=$size
+    printf '%s' "$chunk" | grep -Eiq "$LIMIT_PAT" || continue
+    log "limit line in $f: $(printf '%s' "$chunk" | grep -Eim1 "$LIMIT_PAT" | cut -c1-200)"
+    : >"$LIMIT_FLAG"
+    stop_oc
+    return 0
+  done
+}
+
+resume() {
+  local out rc msg=$RESUME_MSG auto=()
+  [ "$AUTO_CONTINUE" = 1 ] && auto=(--auto)
+  export_proxy
+  log "resume: ip=$(current_ip) msg=$msg"
+  out=$(cd "$FOLDER" && timeout -k 5 "$RESUME_TIMEOUT" "${OC_CMD[@]}" run "${auto[@]}" -c "$msg" 2>&1); rc=$?
+  printf '%s\n' "$out" | tail -n 6
+  if printf '%s' "$out" | grep -Eiq "$LIMIT_PAT"; then return 2; fi
+  return $rc
+}
+
+# ---------------------------------------------------------------- the loop
+cmd_run() {
+  [ -d "$FOLDER" ] || { err "folder not found: $FOLDER"; return 1; }
+  oc_cmd
+  have "${OC_CMD[0]}" || { err "opencode not found: ${OC_CMD[0]} (set OC= in $CONFIG)"; return 1; }
+  mkdir -p "$OC_LOG_DIR" 2>/dev/null
+
+  resolve_method
+  if [ "$METHOD" = none ] && [ "$EGRESS" != none ]; then
+    warn 'no egress method came up; the chat runs on the plain route and cannot rotate'
+  fi
+  export_proxy
+
+  local ip; ip=$(current_ip)
+  say 36 "OP $OP_VERSION"
+  dim "folder   $FOLDER"
+  dim "egress   $METHOD${PROXY_URL:+ ($PROXY_URL)}"
+  dim "exit IP  ${ip:-unknown} $(current_loc)"
+  dim "log      $LOG"
+  echo
+
+  local rc tpid wpid cont=() crash=0 crash_last=0 now
+  while :; do
+    rm -f "$LIMIT_FLAG"
+    : >"$OC_PID"
+    export_proxy
+    watch_log "$OC_LOG_DIR" & wpid=$!
+    # background + wait: a killed foreground job makes bash print "Terminated" over the TUI
+    ( cd "$FOLDER" && echo "$BASHPID" >"$OC_PID" && exec "${OC_CMD[@]}" "${cont[@]}" ) &
+    tpid=$!
+    wait "$tpid"; rc=$?
+    kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
+    : >"$OC_PID"
+
+    if [ -f "$LIMIT_FLAG" ]; then
+      rm -f "$LIMIT_FLAG"
+      echo
+      warn 'limit hit'
+      if ! rot_gate; then
+        err "$ROTATE_GATE_MAX rotations in $((ROTATE_GATE_WINDOW / 60)) minutes: stopping so it does not loop"
+        return 1
+      fi
+      if [ "$ASK" = 1 ]; then
+        local a=""; printf '  rotate the IP now? [Y/n] '
+        IFS= read -r -t 60 a || true
+        [[ ${a,,} == n* ]] && { cont=(--continue); continue; }
+      fi
+      if ! hunt; then err 'no new route: stopping'; return 1; fi
+      ok "new route: $(current_ip) $(current_loc)"
+      resume; rc=$?
+      if [ "$rc" = 2 ] || [ "$rc" = 124 ]; then
+        warn 'the new IP is limited too'
+      fi
+      cont=(--continue)
+      continue
+    fi
+
+    case $rc in 0|130|143) log "opencode exit rc=$rc"; return 0 ;; esac
+
+    # a crash is not a limit: retry on the same route, twice, then stop
+    now=$(date +%s)
+    [ $((now - crash_last)) -gt 600 ] && crash=0
+    crash_last=$now; crash=$((crash + 1))
+    log "opencode crashed rc=$rc streak=$crash"
+    if [ "$crash" -gt 2 ]; then err "opencode crashed $crash times in 10 minutes: stopping"; return 1; fi
+    warn "opencode exited with $rc, retrying on the same route"
+    resume >/dev/null 2>&1
+    cont=(--continue)
+  done
+}
+
+# ---------------------------------------------------------------- commands
+cmd_status() {
+  oc_cmd
+  resolve_method
+  export_proxy
+  local ip loc
+  ip=$(current_ip); loc=$(current_loc)
+  printf 'OP %s\n' "$OP_VERSION"
+  printf '  folder      %s\n' "$FOLDER"
+  printf '  egress      %s\n' "$METHOD"
+  printf '  proxy       %s\n' "${PROXY_URL:-direct}"
+  printf '  exit IP     %s\n' "${ip:-unknown}"
+  printf '  country     %s\n' "${loc:-??}"
+  printf '  gateway     %s\n' "$(gateway_ok && echo reachable || echo blocked)"
+  printf '  opencode    %s\n' "$("${OC_CMD[@]}" --version 2>/dev/null | head -n1)"
+  printf '  config      %s\n' "$CONFIG"
+  printf '  state       %s\n' "$STATE"
+  printf '  log         %s\n' "$LOG"
+  printf '  rotations   %s in the last %s min\n' "$([ -f "$ROT_HIST" ] && wc -l <"$ROT_HIST" || echo 0)" "$((ROTATE_GATE_WINDOW / 60))"
+}
+
+cmd_rotate() {
+  oc_cmd
+  resolve_method
+  export_proxy
+  ok "current exit IP $(current_ip) $(current_loc)"
+  if hunt; then
+    ok "new exit IP $(current_ip) $(current_loc)"
+    return 0
+  fi
+  return 1
+}
+
+usage() {
+  cat <<EOF
+OP $OP_VERSION - OpenCode that does not stop when the free tier does.
+
+  ./start [options]          run the chat in this folder
+  ./start status             route, exit IP, paths
+  ./start rotate             new exit IP, verified
+  ./start test               offline self-test of the whole loop
+
+options
+  --folder DIR               folder to run the chat in (default: \$PWD)
+  --egress auto|warp|tor|proxy|exec|none
+  --no-probe                 skip the throwaway-session check
+  --dry-run                  print what would run, then exit
+  -h, --help
+
+config: $CONFIG
+  EGRESS=auto            OC=opencode           FOLDER=...
+  PROXY_LIST=url|file    ROTATE_TRIES=8        PROBE=1
+  WARP_PORT=40000        TOR_SOCKS=9050        RESUME_MSG=continue
+  LIMIT_PAT='...'        ROTATE_GATE_MAX=5     ASK=0
+
+egress
+  warp    cloudflare WARP through warp-cli (rotates by re-registering)
+  tor     tor + privoxy bridge (rotates by restarting the circuit)
+  proxy   http proxies from PROXY_LIST, any text with ip:port in it
+  exec    your own EGRESS_CMD that builds the tunnel and prints its proxy url
+  none    plain route, no rotation
+EOF
+}
+
+# ---------------------------------------------------------------- self-test
+# Offline end-to-end test: a fake opencode that writes a limit line, a fake
+# trace that changes IP on each rotation, the real gateway check. Exercises
+# detection, rotation, the same-IP rule, the probe, the resume and the loop guard.
+self_test() {
+  local T; T=$(mktemp -d "${TMPDIR:-/tmp}/op-test.XXXXXX") || exit 1
+  local ipf=$T/trace fake=$T/opencode logd=$T/log counter=$T/n
+  mkdir -p "$logd" "$T/state"
+  printf 'ip=10.0.0.1\nloc=XX\n' >"$ipf"
+  echo 1 >"$counter"
+
+  cat >"$fake" <<'EOS'
+#!/usr/bin/env bash
+for a in "$@"; do
+  case $a in
+    run)     echo '{"ok":true}'; exit 0 ;;
+    session) exit 0 ;;
+    --version) echo "fake 0.0.0"; exit 0 ;;
+    -*)      ;;
+    *)       break ;;
+  esac
+done
+printf 'timestamp=%s level=ERROR message="provider.free-limit" error="free usage limit reached"\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%S)" >>"$FAKE_LOG"
+exec sleep 60
+EOS
+  cat >"$T/rot.sh" <<EOS
+#!/usr/bin/env bash
+n=\$(cat "$counter"); n=\$((n + 1)); echo \$n >"$counter"
+printf 'ip=10.0.0.%s\nloc=XX\n' "\$n" >"$ipf"
+EOS
+  chmod +x "$fake" "$T/rot.sh"
+
+  export FAKE_LOG=$logd/opencode.log
+  : >"$FAKE_LOG"
+
+  # only the pieces that touch the outside world are swapped; the loop is the real one
+  STATE=$T/state LOG=$T/state/op.log OC_PID=$T/state/oc.pid LIMIT_FLAG=$T/state/limit.flag ROT_HIST=$T/state/rotations
+  OC_LOG_DIR=$logd OC=$fake EGRESS=exec EGRESS_CMD=$T/rot.sh TRACE_CMD="cat '$ipf'"
+  ROTATE_TRIES=2 ROTATE_COOLDOWN=0 ROUTE_WAIT=3 ROTATE_GATE_MAX=2 WATCH_INTERVAL=0.3
+  PROBE_TIMEOUT=15 RESUME_TIMEOUT=15 FOLDER=$T
+  init_state
+
+  say 36 "OP self-test"
+  dim "state $T/state"
+  echo
+  local rc=0
+  cmd_run; rc=$?
+
+  local rotations; rotations=$(( $(cat "$counter") - 1 ))
+  local resumes;   resumes=$(grep -c 'resume: ip=' "$LOG" 2>/dev/null || true)
+  local limits;    limits=$(grep -c 'limit line in' "$LOG" 2>/dev/null || true)
+  echo
+  printf '  limit detected   %s\n' "$limits"
+  printf '  rotations        %s (expect 3)\n' "$rotations"
+  printf '  resumes          %s (expect 2)\n' "$resumes"
+  printf '  exit             %s (expect 1, loop guard)\n' "$rc"
+  if [ "$limits" -ge 1 ] && [ "$rotations" = 3 ] && [ "$resumes" = 2 ] && [ "$rc" = 1 ]; then
+    ok 'PASS'
+    rm -rf "$T"
+    return 0
+  fi
+  err 'FAIL'
+  dim "artifacts kept in $T"
+  return 1
+}
+
+# ---------------------------------------------------------------- main
+main() {
+  local cmd=run
+  case ${1:-} in
+    status|rotate|test|help|-h|--help) cmd=$1; shift ;;
+    -*) ;;
+    "") ;;
+    *) cmd=$1; shift ;;
+  esac
+
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --folder)  FOLDER=$2; shift 2 ;;
+      --egress)  EGRESS=$2; shift 2 ;;
+      --no-probe) PROBE=0; shift ;;
+      --dry-run) DRY=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) err "unknown option: $1"; usage; exit 2 ;;
+    esac
+  done
+
+  case $cmd in
+    help) usage; exit 0 ;;
+    test) init_state; self_test; exit $? ;;
+  esac
+
+  load_config
+  init_state
+
+  if [ "${DRY:-0}" = 1 ]; then
+    oc_cmd
+    printf 'OP %s\n' "$OP_VERSION"
+    printf '  folder   %s\n' "$FOLDER"
+    printf '  egress   %s\n' "$EGRESS"
+    printf '  command  cd %s && %s\n' "$FOLDER" "${OC_CMD[*]}"
+    printf '  config   %s\n' "$CONFIG"
+    printf '  state    %s\n' "$STATE"
+    exit 0
+  fi
+
+  case $cmd in
+    run)    cmd_run ;;
+    status) cmd_status ;;
+    rotate) cmd_rotate; exit $? ;;
+    *) err "unknown command: $cmd"; usage; exit 2 ;;
+  esac
+}
+
+main "$@"

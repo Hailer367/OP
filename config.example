@@ -1,0 +1,34 @@
+# OP config: KEY=VALUE, one per line, no quotes. Copy to ~/.config/op/config
+# Anything here can also be set in the environment.
+
+# auto | warp | tor | proxy | exec | none
+EGRESS=auto
+
+# path to the opencode binary (a .js path is run with node)
+OC=opencode
+
+# url or file, any text: every ip:port in it is a proxy candidate
+PROXY_LIST=
+
+# attempts per limit, and how long a new route may take to answer
+ROTATE_TRIES=8
+ROUTE_WAIT=15
+ROTATE_COOLDOWN=2
+
+# stop instead of rotating forever: N rotations per WINDOW seconds
+ROTATE_GATE_MAX=5
+ROTATE_GATE_WINDOW=1800
+
+# prove the new IP with a throwaway session before resuming
+PROBE=1
+PROBE_TIMEOUT=120
+
+# what the resumed turn is nudged with
+RESUME_MSG=continue
+RESUME_TIMEOUT=180
+
+# ask before rotating (0 = rotate by itself)
+ASK=0
+
+# what counts as a limit in the opencode log
+LIMIT_PAT=free-limit|free usage|usage limit|out of usage|insufficient credits|payment required|quota exceeded|limit reached|rate limit|429

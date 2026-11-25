@@ -17,7 +17,7 @@
 
 set -uo pipefail
 
-OP_VERSION=0.4.0
+OP_VERSION=0.4.1
 SELF=$(readlink -f -- "${BASH_SOURCE[0]}")
 SELF_DIR=$(dirname -- "$SELF")
 
@@ -642,6 +642,17 @@ cmd_run() {
   export_proxy
 
   local ip; ip=$(current_ip)
+  # The chat is a full-screen TUI and needs a real terminal for input. Pick the
+  # source here, by actually opening it: /dev/tty exists even when there is no
+  # controlling terminal, and a failed redirect would kill every launch.
+  if [ -t 0 ]; then TTY_IN=/dev/stdin
+  elif { : </dev/tty; } 2>/dev/null; then TTY_IN=/dev/tty
+  else TTY_IN=/dev/null; fi
+  if [ "$TTY_IN" = /dev/null ]; then
+    warn 'no terminal: the chat needs one (run ./start from a terminal, not nohup)'
+  elif [ ! -t 1 ]; then
+    warn 'stdout is not a terminal: the chat cannot draw properly (run ./start directly)'
+  fi
   say 36 "OP $OP_VERSION"
   dim "folder   $FOLDER"
   dim "egress   $METHOD${PROXY_URL:+ ($PROXY_URL)}"
@@ -650,16 +661,28 @@ cmd_run() {
   echo
 
   local rc tpid wpid cont=() crash=0 crash_last=0 now kind a
+  local SIGRESET=()
+  if env --default-signal=INT true 2>/dev/null; then SIGRESET=(env --default-signal=INT); fi
   while :; do
     rm -f "$LIMIT_FLAG"
     : >"$OC_PID"
     token_guard
     export_proxy
+    # A background job in a non-interactive shell gets stdin from /dev/null
+    # (POSIX), so OpenCode could never read a key: it would draw over the screen
+    # and typing would go nowhere. stdin is bound to the terminal above. Running
+    # it in the background also keeps bash from printing "Terminated" over the
+    # screen when the watcher kills it for a rotation.
+    # Ctrl+C belongs to the chat, not to the supervisor: ignore it here so a
+    # response interrupt cannot take OP (or the watcher) down and leave the chat
+    # unsupervised. GNU env hands the chat the default disposition back, so it
+    # still gets Ctrl+C. The watcher is started after this on purpose.
+    if [ "${#SIGRESET[@]}" -gt 0 ]; then trap '' INT; fi
     watch_log "$OC_LOG_DIR" & wpid=$!
-    # background + wait: a killed foreground job makes bash print "Terminated" over the TUI
-    ( cd "$FOLDER" && echo "$BASHPID" >"$OC_PID" && exec "${OC_CMD[@]}" "${cont[@]}" ) &
+    ( cd "$FOLDER" && echo "$BASHPID" >"$OC_PID" && exec ${SIGRESET[@]+"${SIGRESET[@]}"} "${OC_CMD[@]}" "${cont[@]}" ) <"$TTY_IN" &
     tpid=$!
     wait "$tpid"; rc=$?
+    if [ "${#SIGRESET[@]}" -gt 0 ]; then trap - INT; fi
     kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
     : >"$OC_PID"
 

@@ -34,6 +34,11 @@ on whatever egress is available. `AUTO_INSTALL=0` turns the install off.
 Flags: `--folder DIR`, `--egress auto|warp|tor|proxy|exec|none`, `--no-probe`,
 `--dry-run`.
 
+Run it from a terminal. The chat is a full-screen TUI and needs one for input and
+drawing; through `nohup`, `setsid`, a pipe or a CI shell there is nothing to type
+into and OP says so instead of opening a broken screen. Ctrl+C goes to the chat,
+not to OP: interrupting a response will not take the supervisor down with it.
+
 ## Egress
 
 `auto` (the default) installs WARP if needed, brings it up, and only falls back to

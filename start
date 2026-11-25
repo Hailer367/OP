@@ -17,11 +17,12 @@
 
 set -uo pipefail
 
-OP_VERSION=0.1.0
+OP_VERSION=0.2.0
 SELF=$(readlink -f -- "${BASH_SOURCE[0]}")
 SELF_DIR=$(dirname -- "$SELF")
 
 # ---------------------------------------------------------------- defaults
+WARP_TOS=(); WARP_NEW=0
 EGRESS=${EGRESS:-auto}           # auto | warp | tor | proxy | exec | none
 OC=${OC:-opencode}               # path to the opencode binary (a .js path is run with node)
 FOLDER=${FOLDER:-$PWD}           # folder the chat lives in
@@ -136,30 +137,89 @@ port_wait() {
 }
 
 # ---------------------------------------------------------------- egress: WARP
+# warp-cli needs the warp-svc daemon, which needs root (or passwordless sudo).
+# The CLI changed syntax: 2023+ has "mode proxy" / "proxy port", older builds have
+# "set-mode" / "set-proxy-port". Both are handled.
 warp_installed() { have warp-cli; }
-warp_cli() {
-  if [ "$(id -u)" -eq 0 ]; then timeout 30 warp-cli --accept-tos "$@"
-  else timeout 30 sudo -n warp-cli --accept-tos "$@"; fi
+
+warp_cli() {  # root, passwordless sudo, or the user's own daemon socket; never prompts
+  if [ "$(id -u)" -eq 0 ]; then timeout 30 warp-cli "${WARP_TOS[@]}" "$@"
+  elif have sudo && sudo -n true 2>/dev/null; then timeout 30 sudo -n warp-cli "${WARP_TOS[@]}" "$@"
+  else timeout 30 warp-cli "${WARP_TOS[@]}" "$@"; fi
 }
 warp_run() { warp_cli "$@" >>"$LOG" 2>&1; }
 
-warp_up() {
-  warp_installed || return 1
-  warp_run registration show >/dev/null 2>&1 || warp_run registration new || return 1
-  warp_run mode proxy; warp_run proxy port "$WARP_PORT"; warp_run connect
+warp_detect() {
+  WARP_TOS=()
+  if warp_cli --accept-tos status >/dev/null 2>&1; then WARP_TOS=(--accept-tos); fi
+  WARP_NEW=0
+  if warp_cli --help 2>/dev/null | grep -qiE '^[[:space:]]*(mode|proxy)[[:space:]]{2,}'; then WARP_NEW=1; fi
+  log "warp: tos=${WARP_TOS[*]:-none} syntax=$([ "$WARP_NEW" = 1 ] && echo new || echo old)"
+}
+
+warp_svc_up() {
+  have systemctl || return 0
+  systemctl is-active --quiet warp-svc 2>/dev/null && return 0
+  if [ "$(id -u)" -eq 0 ]; then systemctl enable --now warp-svc >>"$LOG" 2>&1
+  elif have sudo && sudo -n true 2>/dev/null; then sudo -n systemctl enable --now warp-svc >>"$LOG" 2>&1
+  else return 1; fi
+  sleep 2
+  systemctl is-active --quiet warp-svc 2>/dev/null
+}
+
+# "Disconnected" must not read as connected
+warp_connected() {
+  warp_cli status 2>/dev/null | tr 'A-Z' 'a-z' | grep -qE '(^|[^a-z])connected([^a-z]|$)'
+}
+
+warp_apply_mode() {
+  if [ "$WARP_NEW" = 1 ]; then
+    warp_run mode proxy; warp_run proxy port "$WARP_PORT"
+  else
+    warp_run set-mode proxy; warp_run set-proxy-port "$WARP_PORT"
+  fi
+}
+
+# The proxy answering is not enough: it has to be WARP carrying the traffic.
+warp_proxy_ok() {
+  local t
+  t=$(curl -s -m 15 -x "http://127.0.0.1:$WARP_PORT" "$TRACE_URL" 2>/dev/null)
+  printf '%s' "$t" | grep -qE '^warp=(on|plus)'
+}
+
+warp_wait() {
   local i
   for ((i = 0; i < WARP_WAIT; i++)); do
-    warp_cli status 2>/dev/null | grep -qi connected && break
+    warp_connected && return 0
     sleep 1
   done
+  return 1
+}
+
+warp_up() {
+  warp_installed || { log 'warp-cli missing'; return 1; }
+  warp_svc_up || { log 'warp-svc is not running (needs root or passwordless sudo)'; return 1; }
+  warp_cli registration show >/dev/null 2>&1 || warp_run registration new || { log 'warp registration failed'; return 1; }
+  warp_apply_mode
+  warp_run connect
+  warp_wait || { log 'warp did not connect'; return 1; }
   PROXY_URL="http://127.0.0.1:$WARP_PORT"
+  if ! warp_proxy_ok; then log 'warp proxy is not answering with warp=on'; PROXY_URL=""; return 1; fi
   gateway_ok
 }
+
+# a new registration is what gives a new exit IP
 warp_rotate() {
   warp_installed || return 1
+  warp_run disconnect
   warp_run registration delete
-  warp_run registration new || return 1
-  warp_up
+  warp_run registration new || { log 'warp re-registration failed'; return 1; }
+  warp_apply_mode
+  warp_run connect
+  warp_wait || { log 'warp did not reconnect'; return 1; }
+  PROXY_URL="http://127.0.0.1:$WARP_PORT"
+  if ! warp_proxy_ok; then log 'warp proxy is not answering with warp=on'; PROXY_URL=""; return 1; fi
+  gateway_ok
 }
 
 # ---------------------------------------------------------------- egress: TOR
@@ -234,15 +294,18 @@ resolve_method() {
   METHOD=$EGRESS
   case $EGRESS in
     auto)
-      if warp_installed && warp_up; then METHOD=warp
-      elif have tor && have privoxy && tor_start; then METHOD=tor
-      elif proxy_pick; then METHOD=proxy
-      else METHOD=none; PROXY_URL=""; fi
+      METHOD=none; PROXY_URL=""
+      if warp_installed; then
+        warp_detect
+        if warp_up; then METHOD=warp; fi
+      fi
+      if [ "$METHOD" = none ] && have tor && have privoxy && tor_start; then METHOD=tor; fi
+      if [ "$METHOD" = none ] && proxy_pick; then METHOD=proxy; fi
       ;;
-    warp)  METHOD=warp;  warp_up  || { log 'warp did not come up'; METHOD=none; PROXY_URL=""; } ;;
-    tor)   METHOD=tor;   tor_start || { log 'tor did not come up'; METHOD=none; PROXY_URL=""; } ;;
-    proxy) METHOD=proxy; proxy_pick || { log 'no proxy answered'; METHOD=none; PROXY_URL=""; } ;;
-    exec)  METHOD=exec;  exec_up  || { log 'egress command failed'; METHOD=none; PROXY_URL=""; } ;;
+    warp)  warp_detect; if ! warp_up; then log 'warp did not come up'; METHOD=none; PROXY_URL=""; fi ;;
+    tor)   tor_start || { log 'tor did not come up'; METHOD=none; PROXY_URL=""; } ;;
+    proxy) proxy_pick || { log 'no proxy answered'; METHOD=none; PROXY_URL=""; } ;;
+    exec)  exec_up  || { log 'egress command failed'; METHOD=none; PROXY_URL=""; } ;;
     none)  METHOD=none; PROXY_URL="" ;;
     *)     err "unknown egress: $EGRESS"; exit 2 ;;
   esac

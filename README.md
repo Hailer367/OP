@@ -28,14 +28,32 @@ Flags: `--folder DIR`, `--egress auto|warp|tor|proxy|exec|none`, `--no-probe`,
 
 | method | needs | rotation |
 |---|---|---|
-| `warp` | `warp-cli` (run as root or with passwordless sudo) | re-register, reconnect |
+| `warp` | `warp-cli` + `warp-svc`, root or passwordless sudo | re-register, reconnect |
 | `tor` | `tor` + `privoxy` | restart the circuit |
 | `proxy` | `curl` + `PROXY_LIST` | next proxy that answers |
 | `exec` | your `EGRESS_CMD` | your command runs again |
 | `none` | — | no rotation |
 
+### WARP
+
+```bash
+curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+  | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] \
+https://pkg.cloudflareclient.com/ $(. /etc/os-release; echo $VERSION_CODENAME) main" \
+  | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+sudo apt-get update && sudo apt-get install -y cloudflare-warp
+sudo systemctl enable --now warp-svc
+```
+
+OP starts `warp-svc` if it is down, registers the client, switches it to proxy mode
+on `WARP_PORT`, connects, and refuses the route unless the proxy reports `warp=on`.
+Both CLI syntaxes are handled (`mode proxy` / `proxy port` and the older
+`set-mode` / `set-proxy-port`). Rotation is a fresh registration, so each rotation
+costs one — that is what the loop guard is for.
+
 `PROXY_LIST` is a URL or a local file, any format: every `ip:port` in it is a
-candidate. Free lists are unreliable; a cheap rotating proxy or WARP is better.
+candidate. Free lists are unreliable; WARP is faster and steadier.
 
 `exec` is the escape hatch for anything else — WireGuard, an SSH SOCKS tunnel,
 Mullvad, a cloud function:
